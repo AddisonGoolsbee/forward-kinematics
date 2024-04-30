@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>CPSC 487/587</title>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/10.3.0/math.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/quaternion@1.5.1/quaternion.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/numeric@1.2.6/numeric-1.2.6.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+              "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+              "three/": "https://unpkg.com/three@0.160.0/"
+            }
+        }
+    </script>
+</head>
+<body>
+<script type="module">
+    import {ThreeEngine, get_default_lil_gui, refresh_displays} from "../js/utils/utils_three.js";
+    import {B1Z1Robot, XArm7Robot} from "../js/utils/utils_robot.js";
+    import {mul_matrix_matrix, mul_matrix_scalar, add_matrix_matrix} from "../js/utils/utils_math.js";
+
+    // todo: create a visualization that demonstrates your knowledge of forward kinematics on a robot model.
+    // todo: The "default" assignment is to recreate this visualization:
+    // todo: https://yale-cpsc-487-587-internal-djrakita-c95fa6c3239a481a48d29a6b0fd.gitlab.io/html/unit4_visualizations/fk.html
+    // todo: or this visualization:
+    // todo: https://yale-cpsc-487-587-internal-djrakita-c95fa6c3239a481a48d29a6b0fd.gitlab.io/html/unit4_visualizations/fk2.html
+    // todo: however, feel free to deviate from this if you want to.
+    // todo: I will be adding information to the class wiki on important properties and subroutines regarding the robot
+    // todo: object created for this class.  If you have questions, refer to that wiki or ask me over slack.
+
+    let engine = ThreeEngine.new_default_3d();
+
+    let robot = new XArm7Robot();
+    robot.spawn_robot(engine);
+
+    let links = robot.links;
+    let joints = robot.joints;
+    let kinematic_hierarchy = robot.kinematic_hierarchy;
+
+    let settings = {}
+    let joint_count = 0;
+    joints.forEach(element => {
+        if (element.joint_type_string != 'fixed') {
+            let joint_name = 'dof' + joint_count;
+            joint_count++;
+            settings[joint_name] = 0;
+        }
+    });
+
+
+    let actions = {
+        reset: function() {
+            joint_count = 0;
+            joints.forEach(element => {
+                if (element.joint_type_string != 'fixed') {
+                    let joint_name = 'dof' + joint_count;
+                    settings[joint_name] = 0;
+                    joint_count++;
+                }
+            });
+            refresh_displays(gui);
+        }
+    }
+
+    let gui = get_default_lil_gui();
+    joint_count = 0;
+    joints.forEach(element => {
+        if (element.joint_type_string != 'fixed') {
+            let joint_name = 'dof' + joint_count;
+            joint_count++;
+            gui.add(settings, joint_name, element.lower_bound, element.upper_bound).name(joint_name)
+        }
+    });
+    gui.add(actions, 'reset').name('Reset')
+
+    const x = [ [0.07], [0], [0] ];
+    const y = [ [0], [0.07], [0] ];
+    const z = [ [0], [0], [0.07] ];
+
+    const exponentiate_so3 = (m) => {
+        let beta = Math.sqrt(m[0][0] * m[0][0] + m[1][0] * m[1][0] + m[2][0] * m[2][0]);
+        let p = beta > 0.000001 ? Math.sin(beta) / beta : 0;
+        let q = beta > 0.000001 ? (1 - Math.cos(beta)) / (beta * beta) : 0;
+        
+        let m1 = numeric.identity(3);
+        let m2 = mul_matrix_scalar(m, p);
+        let m3 = mul_matrix_scalar(mul_matrix_matrix(m, m), q);
+        let m_e = add_matrix_matrix(add_matrix_matrix(m1, m2), m3);
+        return m_e;
+    }
+
+    const get_next_transformation = (joint, angle, prev_transformation) => {
+        const T_i = prev_transformation;
+        const T_c = joint.xyz_rpy_SE3_matrix;
+        let T_j = numeric.identity(4);
+        if (joint.joint_type_string === 'revolute') {
+            let axis = joint.axis;
+            let a = axis[0][0];
+            let b = axis[1][0];
+            let c = axis[2][0];
+            let m = [[0, -c, b], [c, 0, -a], [-b, a, 0]];
+            m = mul_matrix_scalar(m, angle);
+            let m_e = exponentiate_so3(m);
+            T_j = [[m_e[0][0], m_e[0][1], m_e[0][2], 0],
+                   [m_e[1][0], m_e[1][1], m_e[1][2], 0],
+                   [m_e[2][0], m_e[2][1], m_e[2][2], 0],
+                   [0, 0, 0, 1]];
+        } else if (joint.joint_type_string === 'prismatic') {
+            let axis = joint.axis;
+            let translation = numeric.mul(axis, angle);
+            T_j[0][3] = translation[0][0];
+            T_j[1][3] = translation[1][0];
+            T_j[2][3] = translation[2][0];
+        }
+        // if fixed, T_j remains as the identity matrix
+        let T = mul_matrix_matrix(mul_matrix_matrix(T_i, T_c), T_j);
+        return T
+    }
+
+    const calculate_forward_kinematics = () => {
+        let transformation = numeric.identity(4);
+        let joint_count = 0;
+        links.forEach(element => {
+            if (element.children_joint_idxs.length == 0) {
+                return;
+            }
+
+            // get joint
+            let joint_idx = element.children_joint_idxs[0]
+            let joint = joints[joint_idx];
+
+            // get angle name
+            if (joint.joint_type_string !== 'fixed') {
+                let joint_name = 'dof' + joint_count;
+                joint_count++;
+                let angle = settings[joint_name];
+                transformation = get_next_transformation(joint, angle, transformation);
+            }
+
+            // set pose
+            robot.set_link_mesh_pose_from_SE3_matrix(engine, element.link_idx + 1, transformation);
+            // set debug vectors
+            let so3 = [[transformation[0][0], transformation[0][1], transformation[0][2]],
+                       [transformation[1][0], transformation[1][1], transformation[1][2]],
+                       [transformation[2][0], transformation[2][1], transformation[2][2]]];
+            let t = [[transformation[0][3]], [transformation[1][3]], [transformation[2][3]]];
+            engine.draw_debug_line(t, add_matrix_matrix(t, mul_matrix_matrix(so3, x)), true, 0.002, 0xff2222);
+            engine.draw_debug_line(t, add_matrix_matrix(t, mul_matrix_matrix(so3, y)), true, 0.002, 0x22ff22);
+            engine.draw_debug_line(t, add_matrix_matrix(t, mul_matrix_matrix(so3, z)), true, 0.002, 0x2222ff);
+
+        });
+        
+    }
+
+    engine.animation_loop( ()  => {
+        calculate_forward_kinematics();
+    });
+
+</script>
+</body>
+</html>
